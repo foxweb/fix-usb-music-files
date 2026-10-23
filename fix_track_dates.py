@@ -9,6 +9,9 @@
 Содержимое файлов не меняется, только метки времени.
 По умолчанию скрипт ничего не записывает, а печатает план.
 
+На Linux у os.stat нет даты создания. Она читается через statx.
+Записать на FAT можно только дату изменения: ядро не принимает новую дату создания.
+
 Если два альбома скопированы почти одновременно, их интервалы раздвигаются,
 чтобы при общей сортировке по дате альбомы не перемешивались.
 Дата самого нового файла на флешке не сдвигается в будущее.
@@ -34,6 +37,11 @@ from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STEP_SECONDS = 2
+CAN_SET_BIRTH = sys.platform == "darwin"
+
+AT_FDCWD = -100
+AT_SYMLINK_NOFOLLOW = 0x100
+STATX_BTIME = 0x00000800
 
 AUDIO_EXT = {
     ".mp3",
@@ -116,6 +124,87 @@ def fmt(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
+class statx_timestamp(ctypes.Structure):
+    _fields_ = [
+        ("tv_sec", ctypes.c_int64),
+        ("tv_nsec", ctypes.c_uint32),
+        ("_reserved", ctypes.c_int32),
+    ]
+
+
+class statx_buf(ctypes.Structure):
+    # Полный struct statx из linux/stat.h — 256 байт, до 0x100.
+    # Ядро пишет структуру целиком. Короткий буфер затирает память и даёт SIGSEGV.
+    _fields_ = [
+        ("stx_mask", ctypes.c_uint32),
+        ("stx_blksize", ctypes.c_uint32),
+        ("stx_attributes", ctypes.c_uint64),
+        ("stx_nlink", ctypes.c_uint32),
+        ("stx_uid", ctypes.c_uint32),
+        ("stx_gid", ctypes.c_uint32),
+        ("stx_mode", ctypes.c_uint16),
+        ("_spare0", ctypes.c_uint16),
+        ("stx_ino", ctypes.c_uint64),
+        ("stx_size", ctypes.c_uint64),
+        ("stx_blocks", ctypes.c_uint64),
+        ("stx_attributes_mask", ctypes.c_uint64),
+        ("stx_atime", statx_timestamp),
+        ("stx_btime", statx_timestamp),
+        ("stx_ctime", statx_timestamp),
+        ("stx_mtime", statx_timestamp),
+        ("stx_rdev_major", ctypes.c_uint32),
+        ("stx_rdev_minor", ctypes.c_uint32),
+        ("stx_dev_major", ctypes.c_uint32),
+        ("stx_dev_minor", ctypes.c_uint32),
+        ("stx_mnt_id", ctypes.c_uint64),
+        ("stx_dio_mem_align", ctypes.c_uint32),
+        ("stx_dio_offset_align", ctypes.c_uint32),
+        ("_spare3", ctypes.c_uint64 * 12),
+    ]
+
+
+if sys.platform.startswith("linux") and ctypes.sizeof(statx_buf) != 256:
+    raise RuntimeError(f"statx buffer is {ctypes.sizeof(statx_buf)} bytes, expected 256")
+
+
+_statx = getattr(_libc, "statx", None)
+if _statx is not None:
+    _statx.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.POINTER(statx_buf),
+    ]
+    _statx.restype = ctypes.c_int
+
+
+def statx_btime(path: str) -> float | None:
+    if _statx is None:
+        return None
+    buf = statx_buf()
+    result = _statx(
+        AT_FDCWD,
+        os.fsencode(path),
+        AT_SYMLINK_NOFOLLOW,
+        STATX_BTIME,
+        ctypes.byref(buf),
+    )
+    if result != 0 or not (buf.stx_mask & STATX_BTIME):
+        return None
+    return buf.stx_btime.tv_sec + buf.stx_btime.tv_nsec / 1_000_000_000
+
+
+def birth_time(path: str, stat: os.stat_result) -> float:
+    value = getattr(stat, "st_birthtime", None)
+    if value is not None:
+        return float(value)
+    value = statx_btime(path)
+    if value is not None:
+        return value
+    return float(stat.st_mtime)
+
+
 def set_creation_time(path: str, timestamp: int) -> None:
     attr = attrlist()
     attr.bitmapcount = ATTR_BIT_MAP_COUNT
@@ -135,7 +224,8 @@ def set_creation_time(path: str, timestamp: int) -> None:
 
 def set_both_times(path: str, timestamp: int) -> None:
     os.utime(path, (timestamp, timestamp))
-    set_creation_time(path, timestamp)
+    if CAN_SET_BIRTH:
+        set_creation_time(path, timestamp)
 
 
 def is_audio(filename: str) -> bool:
@@ -164,7 +254,7 @@ def collect_albums(root: str) -> tuple[list[dict], list[str]]:
                 {
                     "path": path,
                     "name": filename,
-                    "birth": stat.st_birthtime,
+                    "birth": birth_time(path, stat),
                     "mtime": stat.st_mtime,
                     "parsed": parse_track(filename),
                 }
@@ -210,8 +300,16 @@ def plan_times(albums: list[dict], oldest_first: bool) -> dict[str, int]:
     return planned
 
 
+def shown_time(track: dict) -> float:
+    if CAN_SET_BIRTH:
+        return track["birth"]
+    return track["mtime"]
+
+
 def needs_update(track: dict, timestamp: int) -> bool:
-    return int(track["birth"]) != timestamp or int(track["mtime"]) != timestamp
+    if int(track["mtime"]) != timestamp:
+        return True
+    return CAN_SET_BIRTH and int(track["birth"]) != timestamp
 
 
 def main() -> int:
@@ -242,6 +340,10 @@ def main() -> int:
     else:
         print("Порядок дат: трек 1 — самый новый, дальше старше на 2 секунды.")
         print("Так плеер, который начинает с новых файлов, играет альбом с первого трека.")
+
+    if not CAN_SET_BIRTH:
+        print("На Linux записывается дата изменения. Дату создания на FAT ядро не меняет.")
+        print("Слева в списке — текущая дата изменения. Альбомы раскладываются по дате создания.")
 
     all_albums, problems = collect_albums(ROOT)
     planned = plan_times(all_albums, args.oldest_first)
@@ -277,7 +379,7 @@ def main() -> int:
             timestamp = planned[track["path"]]
             marker = "  " if track["parsed"] else "??"
             note = "" if track["parsed"] else "  [нет номера, в конец альбома по имени]"
-            old = fmt(track["birth"])
+            old = fmt(shown_time(track))
             new = fmt(timestamp)
             arrow = "==" if not needs_update(track, timestamp) else "->"
             print(f"  {marker} {index:02d}  {old} {arrow} {new}  {track['name']}{note}")
@@ -289,7 +391,10 @@ def main() -> int:
                 unchanged += 1
 
     if args.apply:
-        _libc.sync()
+        if hasattr(os, "sync"):
+            os.sync()
+        else:
+            _libc.sync()
 
     print("\n---")
     print(f"Альбомов: {len(albums)}")
@@ -302,9 +407,13 @@ def main() -> int:
         print(f"  ! {problem}")
 
     if not args.apply:
-        print("\nФайлы не изменены. После проверки: python3 /Volumes/MUSIC/fix_track_dates.py --apply")
+        script = os.path.abspath(__file__)
+        print(f"\nФайлы не изменены. После проверки: python3 {script} --apply")
     else:
-        print("\nДаты записаны. Перед тем как вынимать флешку, извлеките том в Finder.")
+        if CAN_SET_BIRTH:
+            print("\nДаты записаны. Перед тем как вынимать флешку, извлеките том в Finder.")
+        else:
+            print("\nДаты изменения записаны. Перед тем как вынимать флешку, размонтируйте её.")
     return 0
 
 
